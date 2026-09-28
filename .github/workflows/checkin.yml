@@ -2,8 +2,8 @@ name: Trae Daily Checkin
 
 on:
   schedule:
-    # 北京时间每天 03:07（UTC 19:07）
-    - cron: "7 19 * * *"
+    # 北京时间每天 05:12（UTC 21:12）
+    - cron: "12 21 * * *"
   workflow_dispatch: {}
 
 permissions:
