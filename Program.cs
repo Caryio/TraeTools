@@ -1,4 +1,4 @@
-﻿using Avalonia;
+using Avalonia;
 using System;
 using System.Threading;
 
@@ -21,6 +21,8 @@ sealed class Program
             // 已有实例在运行，直接退出本实例（TraeTools 为单实例工具）
             return;
         }
+        // 旧版 TraeCheckin / TraeSwitch 数据迁移到统一根 %APPDATA%\TraeTools（幂等，保留旧目录）
+        TraeTools.Services.DataPaths.Migrate();
         BuildAvaloniaApp().StartWithClassicDesktopLifetime(args);
     }
 

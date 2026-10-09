@@ -4,6 +4,8 @@
 
 TraeTools 是对 **TRAE-Checkin** 的重构版，并集成了 **Trea-Switch** 的账号切换能力，用 Avalonia 重写为现代化桌面应用（.NET 9）。一个工具覆盖 Trae 账号的「登录 → 签到 → 切换 → 用量查看 → 云端托管」全流程。
 
+### 气死我了，怎么老是给我爆9074
+
 ## 功能特性
 
 - **多账号每日签到**：一页管理多个 Trae 账号，一键签到全部启用账号；自动签到可设定时间，到点自动执行
@@ -26,6 +28,8 @@ TraeTools 是对 **TRAE-Checkin** 的重构版，并集成了 **Trea-Switch** �
 | 设置 | 自动签到配置、Token 信息、飞书推送、账号管理、关于 |
 
 ## 快速开始
+
+> **macOS 用户看这里**：macOS 原生版 TraeBar（菜单栏常驻多账号自动签到，Swift/AppKit 实现）在本仓库的 [`macos`](https://github.com/star620/TraeTools/tree/macos) 分支独立维护与发布，版本 tag 为 `macos-v*`，发布产物见 [Releases](https://github.com/star620/TraeTools/releases)。本分支（main）仅维护 Windows 版。
 
 ### 方式一：直接使用
 在 [Releases](https://github.com/star620/TraeTools/releases) 下载最新版运行（Windows，需 .NET 9 桌面运行时）。

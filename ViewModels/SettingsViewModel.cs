@@ -24,6 +24,9 @@ public partial class SettingsViewModel : ViewModelBase
     private string _autoCheckinTime = "08:00";
 
     [ObservableProperty]
+    private int _checkinIntervalSeconds = 5;
+
+    [ObservableProperty]
     private bool _autoStartEnabled;
 
     [ObservableProperty]
@@ -43,6 +46,10 @@ public partial class SettingsViewModel : ViewModelBase
     [ObservableProperty]
     private string _tokenUpdateTime = "—";
 
+    /// <summary>选中账号的设备号（x-device-id，16 位数字；风控关键）。</summary>
+    [ObservableProperty]
+    private string _deviceIdText = "—";
+
     [ObservableProperty]
     private string _feishuWebhook = "";
 
@@ -50,7 +57,32 @@ public partial class SettingsViewModel : ViewModelBase
     private bool _pushEnabled = true;
 
     [ObservableProperty]
-    private string _pushStatus = "就绪";
+    private string _pushStatus = "";
+
+    /// <summary>底部状态条是否显示（非空状态消息时才显示，消息自动消失后隐藏）。</summary>
+    [ObservableProperty]
+    private bool _showStatusBar;
+
+    private CancellationTokenSource? _statusClearCts;
+
+    /// <summary>状态消息自动消失：非空显示，5 秒后若无新消息则清空隐藏；新消息会重置计时。</summary>
+    partial void OnPushStatusChanged(string value)
+    {
+        ShowStatusBar = !string.IsNullOrEmpty(value);
+        _statusClearCts?.Cancel();
+        _statusClearCts = null;
+        if (string.IsNullOrEmpty(value)) return;
+        var cts = new CancellationTokenSource();
+        _statusClearCts = cts;
+        _ = AutoClearStatusAsync(cts.Token);
+    }
+
+    private async Task AutoClearStatusAsync(CancellationToken ct)
+    {
+        try { await Task.Delay(TimeSpan.FromSeconds(5), ct); }
+        catch (TaskCanceledException) { return; }
+        if (!ct.IsCancellationRequested) PushStatus = "";
+    }
 
     /// <summary>是否正在进行「检查更新」（防止并发下载/安装）。</summary>
     [ObservableProperty]
@@ -68,7 +100,7 @@ public partial class SettingsViewModel : ViewModelBase
     public string OriginalRepoUrl => "https://github.com/star620/TraeTools";
     public string ForkRepoUrl => "https://github.com/star620/TraeTools";
     public string IssuesUrl => "https://github.com/star620/TraeTools/issues";
-    public string AppVersion => "v1.0.0";
+    public string AppVersion => TraeTools.Services.AppVersion.Display;
 
     public SettingsViewModel()
     {
@@ -92,6 +124,7 @@ public partial class SettingsViewModel : ViewModelBase
                     FeishuWebhook = cfg.FeishuWebhook;
                 AutoCheckinEnabled = cfg.AutoCheckinEnabled;
                 AutoCheckinTime = cfg.AutoCheckinTime;
+                CheckinIntervalSeconds = Math.Clamp(cfg.CheckinIntervalSeconds > 0 ? cfg.CheckinIntervalSeconds : 5, 1, 60);
                 MinimizeToTray = cfg.MinimizeToTray;
 
                 var acc = cfg.Accounts.FirstOrDefault(a => a.Id == cfg.ActiveAccountId)
@@ -136,6 +169,9 @@ public partial class SettingsViewModel : ViewModelBase
             {
                 var item = Accounts.FirstOrDefault(a => a.Id == acc.Id);
                 if (item == null) continue;
+
+                // 同步当前激活账号高亮（账号切换后实时框出）
+                item.IsCurrent = acc.Id == cfg.ActiveAccountId;
 
                 // 账号资料（昵称/脱敏手机号/学生认证）后台刷新并回填展示
                 await AccountHelpers.RefreshProfileAsync(acc);
@@ -209,22 +245,94 @@ public partial class SettingsViewModel : ViewModelBase
             {
                 TokenString = MaskToken(acc.Token);
                 TokenUpdateTime = acc.TokenUpdatedAt?.ToString("yyyy-MM-dd HH:mm:ss") ?? "—";
-
-                // 切换全局激活账号（仪表盘/签到页读取 ActiveAccountId）
-                if (cfg!.ActiveAccountId != acc.Id)
-                {
-                    cfg.ActiveAccountId = acc.Id;
-                    try { cfg.Save(); } catch { /* 忽略 */ }
-                    MainViewModel.NotifyActiveAccountChanged();
-                }
+                DeviceIdText = acc.DeviceId;
+                // 设置页仅用于查看/编辑该账号，不再切换全局激活账号
             }
             else
             {
                 TokenString = "（无账号数据）";
                 TokenUpdateTime = "—";
+                DeviceIdText = "—";
             }
         }
         catch { /* 联动失败不影响 */ }
+    }
+
+    /// <summary>
+    /// 手动更换选中账号的设备号（生成全新 16 位数字）。
+    /// 设备号被 Trae 风控标记（签到返回 9074「参与用户太多」）时更换即可解除；
+    /// 更换后云端自动签到需重新「云端部署」以同步新设备号。
+    /// </summary>
+    [RelayCommand]
+    private void RegenerateDeviceId()
+    {
+        try
+        {
+            var cfg = MainViewModel.AppConfig;
+            var acc = cfg?.Accounts.FirstOrDefault(a => a.Id == SelectedAccount?.Id);
+            if (acc == null)
+            {
+                PushStatus = "请先选择账号";
+                return;
+            }
+            acc.DeviceId = Random.Shared.NextInt64(1_000_000_000_000_000L, 10_000_000_000_000_000L).ToString();
+            try { cfg?.Save(); } catch { /* 保存失败提示仍展示 */ }
+            DeviceIdText = acc.DeviceId;
+            PushStatus = $"已更换设备号：{acc.DeviceId}（本地生效；云端需重新部署同步）";
+        }
+        catch (Exception ex)
+        {
+            PushStatus = "更换失败：" + ex.Message;
+        }
+    }
+
+    /// <summary>
+    /// 一键为全部账号更换全新设备号（#40）：多账号逐个换太麻烦，批量换发规避风控。
+    /// 使用 AccountStore.RenewAllDeviceIds 保证每个新号与其它账号互不重复（避免共用触发 9074）。
+    /// 换号后云端部署的 TRAE_DEVICE_ID* 需重新「云端部署」同步。
+    /// </summary>
+    [RelayCommand]
+    private async Task RenewAllDeviceIds()
+    {
+        try
+        {
+            var cfg = MainViewModel.AppConfig;
+            var owner = UiHost.MainWindow;
+            if (cfg == null || owner == null || cfg.Accounts.Count == 0)
+            {
+                PushStatus = cfg == null || cfg.Accounts.Count == 0 ? "暂无账号，请先添加/登录账号" : "主窗口未就绪";
+                return;
+            }
+
+            var ask = new TraeTools.Views.PromptWindow(
+                "一键更换全部设备码",
+                $"将为全部 {cfg.Accounts.Count} 个账号重新生成设备码（互不重复）。\n\n" +
+                "用于多账号被风控（-9074 参与用户太多）时批量规避。\n" +
+                "更换后云端部署需重新「云端部署」同步新的 TRAE_DEVICE_ID*。\n\n是否继续？",
+                "全部更换", "取消");
+            bool ok = owner != null ? await ask.ShowDialog<bool>(owner) : false;
+            if (!ok)
+            {
+                PushStatus = "已取消";
+                return;
+            }
+
+            var store = new TraeCheckin.AccountStore(cfg);
+            int count = store.RenewAllDeviceIds();
+            try { cfg.Save(); } catch { /* 保存失败提示仍展示 */ }
+
+            // 联动 Token 面板显示当前选中账号的新设备号
+            var sel = cfg.Accounts.FirstOrDefault(a => a.Id == SelectedAccount?.Id);
+            if (sel != null) DeviceIdText = sel.DeviceId;
+
+            PushStatus = $"已为全部 {count} 个账号更换新设备码（互不重复）✓";
+            AccountHelpers.AppLog("account", "", $"一键换设备码：已更换全部 {count} 个账号");
+            MainViewModel.NotifyActiveAccountChanged();
+        }
+        catch (Exception ex)
+        {
+            PushStatus = "更换失败：" + ex.Message;
+        }
     }
 
     private void PopulateAccounts()
@@ -262,11 +370,15 @@ public partial class SettingsViewModel : ViewModelBase
                 return;
             }
         }
-        catch { /* 回退 mock */ }
+        catch { /* 加载失败保持空列表 */ }
 
-        Accounts.Add(new AccountInfo { Name = "主号@150", Initial = "主", Color = "#3B82F6", Status = "当前 ✓", StatusType = "ok", CreatedAt = "2026-09-01 14:23", IsCurrent = true });
-        Accounts.Add(new AccountInfo { Name = "备用号@0", Initial = "备", Color = "#10B981", Status = "已建档", StatusType = "info", CreatedAt = "2026-09-05 10:12" });
-        Accounts.Add(new AccountInfo { Name = "测试号@0", Initial = "测", Color = "#F59E0B", Status = "需重登", StatusType = "warn", CreatedAt = "2026-08-28 18:50" });
+        // 无真实账号时不展示示例账号（示例无法被删除，会造成「账号不存在」误导）
+    }
+
+    /// <summary>开关变动立即持久化（写注册表），避免不开「保存设置」直接关窗导致状态丢失。#25</summary>
+    partial void OnAutoStartEnabledChanged(bool value)
+    {
+        try { AutoStartManager.SetEnabled(value); } catch { /* 写注册表失败不阻断 */ }
     }
 
     [RelayCommand]
@@ -283,9 +395,11 @@ public partial class SettingsViewModel : ViewModelBase
             {
                 cfg.AutoCheckinEnabled = AutoCheckinEnabled;
                 cfg.AutoCheckinTime = AutoCheckinTime;
+                cfg.CheckinIntervalSeconds = Math.Clamp(CheckinIntervalSeconds, 1, 60);
                 cfg.FeishuWebhook = FeishuWebhook;
                 cfg.MinimizeToTray = MinimizeToTray;
                 cfg.Save();
+                AccountHelpers.AppLog("account", "", $"设置已保存：自动签到={AutoCheckinEnabled}，时间={AutoCheckinTime}，间隔={cfg.CheckinIntervalSeconds}秒，托盘={MinimizeToTray}");
             }
 
             PushStatus = "已保存 ✓";
@@ -380,6 +494,7 @@ public partial class SettingsViewModel : ViewModelBase
                     {
                         cfg.Accounts.Remove(acc);
                         cfg.Save();
+                        AccountHelpers.CheckinLog(acc.Id[..6], $"添加账号取消：同一手机号已存在（{dup.Name}）");
                         PushStatus = "该账号已存在（" + dup.Name + "），取消重复添加";
                         PopulateAccounts();
                         return;
@@ -391,10 +506,14 @@ public partial class SettingsViewModel : ViewModelBase
                 if (string.IsNullOrWhiteSpace(acc.DeviceId))
                     acc.DeviceId = Random.Shared.NextInt64(1_000_000_000_000_000L, 10_000_000_000_000_000L).ToString();
                 cfg.Save();
+                var accName = string.IsNullOrEmpty(acc.Name) ? acc.Id[..6] : acc.Name!;
+                AccountHelpers.CheckinLog(accName, $"添加账号成功，DeviceId={acc.DeviceId}，Token 长度={acc.Token?.Length ?? 0}");
                 // 立即拉取账号资料（昵称/手机尾号/学生认证），让列表马上展示出真名（force：跳过当日缓存）
                 await AccountHelpers.RefreshProfileAsync(acc, force: true);
                 PushStatus = "账号登录成功 ✓，Token 已保存";
                 PopulateAccounts();
+                // 新账号加入后让仪表盘/用量等全局页立即呈现新账号
+                MainViewModel.NotifyActiveAccountChanged();
             }
             else
             {
@@ -405,6 +524,7 @@ public partial class SettingsViewModel : ViewModelBase
                 else
                     cfg.ActiveAccountId = prevActiveId;
                 cfg.Save();
+                AccountHelpers.CheckinLog("?", "添加账号已取消");
                 PushStatus = "已取消添加账号";
             }
         }
@@ -432,6 +552,7 @@ public partial class SettingsViewModel : ViewModelBase
                 PushStatus = "删除失败：账号不存在";
                 return;
             }
+            AccountHelpers.CheckinLog(SelectedAccount.Name ?? SelectedAccount.Id[..6], "账号已删除");
             cfg.Save();
             PushStatus = "账号已删除";
             PopulateAccounts();
@@ -446,6 +567,8 @@ public partial class SettingsViewModel : ViewModelBase
                 TokenString = "（未登录或未添加账号）";
                 TokenUpdateTime = "—";
             }
+            // 账号增删影响全局账号与仪表盘/用量展示，触发统一刷新（不再通过选中切换）
+            MainViewModel.NotifyActiveAccountChanged();
         }
         catch (Exception ex)
         {
@@ -527,6 +650,71 @@ public partial class SettingsViewModel : ViewModelBase
         PushStatus = "已重置用户协议，即将退出…";
         await Task.Delay(300);
         Environment.Exit(0);
+    }
+
+    /// <summary>
+    /// 重置软件：清空所有账号、签到历史、日志、数据库、配置等用户数据，恢复到初始安装状态。
+    /// 需要两次确认以防止误操作。
+    /// </summary>
+    [RelayCommand]
+    private async Task ResetSoftware()
+    {
+        var owner = UiHost.MainWindow;
+
+        // ---- 第一次确认：告知影响范围 ----
+        var ask1 = new PromptWindow(
+            "重置软件",
+            "此操作将永久删除以下所有数据：\n\n" +
+            "  · 全部账号及登录凭证（Token / Session）\n" +
+            "  · 签到历史记录与数据库\n" +
+            "  · 用量统计记录\n" +
+            "  · 所有调试日志\n" +
+            "  · 账号切换配置与登录态备份\n" +
+            "  · 所有个性化设置\n\n" +
+            "重置后软件将退出，重新启动后回到初始状态。\n\n确定要继续吗？",
+            "继续", "取消");
+        bool go1 = owner != null ? await ask1.ShowDialog<bool>(owner) : false;
+        if (!go1) { PushStatus = "已取消重置"; return; }
+
+        // ---- 第二次确认：最终警告 ----
+        var ask2 = new PromptWindow(
+            "最终确认",
+            "最后警告：此操作不可撤销！\n\n所有账号数据、签到记录、设置将被永久删除。\n\n确认执行重置？",
+            "确认重置", "取消");
+        bool go2 = owner != null ? await ask2.ShowDialog<bool>(owner) : false;
+        if (!go2) { PushStatus = "已取消重置"; return; }
+
+        // ---- 执行清理 ----
+        PushStatus = "正在重置…";
+        try
+        {
+            // 关闭数据库连接
+            try { MainViewModel.CheckinDb?.Dispose(); } catch { /* 忽略 */ }
+
+            var root = DataPaths.Root;
+
+            // 删除整个数据根目录
+            if (Directory.Exists(root))
+            {
+                Directory.Delete(root, recursive: true);
+            }
+
+            // 删除 LocalAppData 下的缓存目录
+            var localRoot = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "TraeTools");
+            if (Directory.Exists(localRoot))
+            {
+                try { Directory.Delete(localRoot, recursive: true); } catch { /* 忽略 */ }
+            }
+
+            PushStatus = "重置完成，即将退出…";
+            await Task.Delay(500);
+            Environment.Exit(0);
+        }
+        catch (Exception ex)
+        {
+            PushStatus = "重置失败：" + ex.Message;
+        }
     }
 
     /// <summary>

@@ -1,3 +1,4 @@
+using System.Windows.Input;
 using Avalonia.Media;
 using CommunityToolkit.Mvvm.ComponentModel;
 
@@ -5,6 +6,8 @@ namespace TraeTools.Models;
 
 public partial class AccountInfo : ObservableObject
 {
+    /// <summary>账号概览卡片点击切换全局账号的命令（由 DashboardViewModel 注入）。</summary>
+    public ICommand? SelectCommand { get; set; }
     /// <summary>源账号 Id（用于 Token 面板联动定位真实账号）。</summary>
     public string Id { get; set; } = string.Empty;
     public string Name { get; set; } = string.Empty;
@@ -17,6 +20,11 @@ public partial class AccountInfo : ObservableObject
     /// <summary>脱敏手机号（账号管理卡片展示）。</summary>
     [ObservableProperty]
     private string _mobileText = "";
+
+    /// <summary>手机号行是否显示（无数据时隐藏，账号切换页用，#14）。</summary>
+    public bool ShowMobile => !string.IsNullOrEmpty(MobileText);
+
+    partial void OnMobileTextChanged(string value) => OnPropertyChanged(nameof(ShowMobile));
     /// <summary>是否学生认证（账号管理卡片展示徽章）。</summary>
     [ObservableProperty]
     private bool _isStudent;
@@ -36,7 +44,9 @@ public partial class AccountInfo : ObservableObject
     public string CreatedAt { get; set; } = string.Empty;
     public int Carriers { get; set; }
     public string Similarity { get; set; } = string.Empty;
-    public bool IsCurrent { get; set; }
+    /// <summary>是否当前激活账号（账号概览/账号管理据此高亮框出当前账号，可观察以随切换实时刷新）。</summary>
+    [ObservableProperty]
+    private bool _isCurrent;
 
     public IBrush AvatarBrush
     {
@@ -89,6 +99,22 @@ public class CheckinRecord
         : (Result == "—" ? new SolidColorBrush(Avalonia.Media.Color.FromRgb(0x94, 0xA3, 0xB8)) : new SolidColorBrush(Avalonia.Media.Color.FromRgb(0xEF, 0x44, 0x44)));
 }
 
+/// <summary>签到页账号勾选项：IsChecked 与 TraeAccount.Enabled 双向同步（勾谁签谁，手动/自动一致）。</summary>
+public sealed partial class AccountCheckItem : ObservableObject
+{
+    /// <summary>源账号 Id。</summary>
+    public required string Id { get; init; }
+    /// <summary>展示名（随账号改名同步刷新）。</summary>
+    public string Display { get; set; } = string.Empty;
+    [ObservableProperty]
+    private bool _isChecked;
+
+    /// <summary>勾选变化回调（由 VM 提供：同步 acc.Enabled 并保存）。</summary>
+    public Action<AccountCheckItem>? OnChanged;
+
+    partial void OnIsCheckedChanged(bool value) => OnChanged?.Invoke(this);
+}
+
 public class CalendarDay
 {
     public int Day { get; set; }
@@ -102,6 +128,7 @@ public class CalendarDay
                 "checked" => new SolidColorBrush(Avalonia.Media.Color.FromRgb(0x3B, 0x82, 0xF6)),
                 "missed" => new SolidColorBrush(Avalonia.Media.Color.FromRgb(0xEF, 0x44, 0x44)),
                 "today" => new SolidColorBrush(0xFFFFFFFF),
+                "blank" => Brushes.Transparent,
                 _ => new SolidColorBrush(Avalonia.Media.Color.FromRgb(0xF1, 0xF5, 0xF9))
             };
         }
@@ -115,6 +142,7 @@ public class CalendarDay
                 "checked" => new SolidColorBrush(0xFFFFFFFF),
                 "missed" => new SolidColorBrush(0xFFFFFFFF),
                 "today" => new SolidColorBrush(Avalonia.Media.Color.FromRgb(0x3B, 0x82, 0xF6)),
+                "blank" => Brushes.Transparent,
                 _ => new SolidColorBrush(Avalonia.Media.Color.FromRgb(0x94, 0xA3, 0xB8))
             };
         }
@@ -123,6 +151,12 @@ public class CalendarDay
         ? new SolidColorBrush(Avalonia.Media.Color.FromRgb(0x3B, 0x82, 0xF6))
         : new SolidColorBrush(0x00FFFFFF);
     public string DisplayDay => Day == 0 ? "" : Day.ToString();
+
+    /// <summary>该格对应日期（blank 无）。</summary>
+    public DateTime? Date { get; set; }
+
+    /// <summary>悬浮提示：当天签到账号及积分情况。</summary>
+    public string ToolTipText { get; set; } = "";
 }
 
 public class SwitchStep

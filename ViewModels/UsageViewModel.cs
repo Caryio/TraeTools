@@ -68,7 +68,7 @@ public partial class UsageViewModel : ViewModelBase
         Reload();
     }
 
-    /// <summary>账号切换/进入页面时同步展示（读本地，不主动拉接口）。</summary>
+    /// <summary>账号切换/进入页面时同步展示（读本地，不主动拉接口）。只跟随全局激活账号。</summary>
     public void Reload()
     {
         var cfg = MainViewModel.AppConfig;
@@ -104,11 +104,14 @@ public partial class UsageViewModel : ViewModelBase
         if (IsLoading) return;
         IsLoading = true;
         StatusMessage = "正在拉取用量数据…";
+        var accName = string.IsNullOrEmpty(acc.Name) ? (acc.Id.Length > 6 ? acc.Id[..6] : acc.Id) : acc.Name!;
+        AccountHelpers.AppLog("usage", accName, $"开始拉取用量数据（近 {FetchDays} 天）");
         try
         {
             bool valid = await AccountHelpers.EnsureValidTokenAsync(acc);
             if (!valid)
             {
+                AccountHelpers.AppLog("usage", accName, "Token 已失效且无法换新");
                 StatusMessage = "Token 已失效且无法换新，请重新登录";
                 return;
             }
@@ -118,6 +121,7 @@ public partial class UsageViewModel : ViewModelBase
             var fetched = await MainViewModel.UsageApi.FetchAllAsync(acc.Token ?? "", acc.Session, start, end);
             if (fetched.Count == 0 && !string.IsNullOrEmpty(MainViewModel.UsageApi.LastError))
             {
+                AccountHelpers.AppLog("usage", accName, $"拉取失败：{MainViewModel.UsageApi.LastError}");
                 StatusMessage = $"拉取失败：{MainViewModel.UsageApi.LastError}";
                 return;
             }
@@ -129,12 +133,14 @@ public partial class UsageViewModel : ViewModelBase
             var expired = await MainViewModel.UsageApi.GetExpiredEntsAsync(acc.Token ?? "", acc.Session);
             UpdateExpiring(expired);
 
+            AccountHelpers.AppLog("usage", accName, $"拉取完成：{fetched.Count} 条新会话");
             StatusMessage = fetched.Count > 0
                 ? $"已同步 {fetched.Count} 条新会话（近 {FetchDays} 天）"
                 : "没有新增会话";
         }
         catch (Exception ex)
         {
+            AccountHelpers.AppLog("usage", accName, $"拉取异常：{ex.Message}");
             StatusMessage = "拉取异常：" + ex.Message;
         }
         finally

@@ -26,6 +26,7 @@ import json
 import os
 import random
 import sys
+import time
 import urllib.request
 
 BASE = "https://api.trae.cn"
@@ -129,6 +130,9 @@ def main():
     all_ok = True
 
     for index, session, device_id in accounts:
+        # 多账号之间错开 3~6 秒随机间隔，降低请求密度，规避 9074「参与用户太多」风控
+        if index > 1:
+            time.sleep(random.uniform(3, 6))
         name = "账号 %d" % index
         device_id = device_id or random_device_id()
         print("[%s] device_id=%s" % (name, device_id))
@@ -138,6 +142,16 @@ def main():
             result = checkin(token, device_id)
             body = result["body"]
             code = body.get("code", -1)
+            # 9074「参与用户太多」= 设备号被风控标记；换全新设备号自动重试（最多 5 次）
+            attempt = 1
+            while code == 9074 and attempt < 5:
+                device_id = random_device_id()
+                attempt += 1
+                print("[%s] 命中风控 9074，换新设备号重试（第 %d 次）" % (name, attempt))
+                time.sleep(random.uniform(0.8, 1.5))
+                result = checkin(token, device_id)
+                body = result["body"]
+                code = body.get("code", -1)
             checked = body.get("checked_in", False)
             ok = (result["http"] == 200) and (code == 0 or checked)
             credits = body.get("credits", 0)

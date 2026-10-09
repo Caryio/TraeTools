@@ -15,7 +15,16 @@ namespace TraeTools.ViewModels;
 public partial class CheckinViewModel : ViewModelBase
 {
     [ObservableProperty]
-    private string _todayReward = "+150";
+    private string _todayReward = "--";
+
+    /// <summary>今日是否已签到（驱动"今日已签到"强调与一键签到按钮禁用联动）。</summary>
+    [ObservableProperty]
+    private bool _checkedInToday;
+
+    /// <summary>一键签到按钮文案：今日已签则显示"今日已签到"。</summary>
+    public string CheckinButtonText => CheckedInToday ? "今日已签到 ✓" : "一键签到";
+
+    partial void OnCheckedInTodayChanged(bool value) => OnPropertyChanged(nameof(CheckinButtonText));
 
     [ObservableProperty]
     private int _streakDays = 0;
@@ -33,10 +42,15 @@ public partial class CheckinViewModel : ViewModelBase
     private double _progressRatio = 0;
 
     [ObservableProperty]
-    private string _progressText = "0/30";
+    private string _progressText = $"0/{DateTime.DaysInMonth(DateTime.Today.Year, DateTime.Today.Month)}";
 
     [ObservableProperty]
     private string _statusMessage = "";
+
+    /// <summary>是否有状态消息需要显示（空则隐藏反馈区）。</summary>
+    public bool HasStatusMessage => !string.IsNullOrEmpty(StatusMessage);
+
+    partial void OnStatusMessageChanged(string value) => OnPropertyChanged(nameof(HasStatusMessage));
 
     /// <summary>标题副标题（动态日期）。</summary>
     [ObservableProperty]
@@ -65,7 +79,6 @@ public partial class CheckinViewModel : ViewModelBase
                     IsMember = acc.IsMember;
                     MemberHint = acc.IsMember ? "会员：基础 150 + 连签 50" : "非会员：基础签到 150 积分";
                     MemberMultiplier = acc.IsMember ? "×1.33" : "×1.0";
-                    TodayReward = acc.IsMember ? "+200" : "+150";
                 }
             }
         }
@@ -73,6 +86,7 @@ public partial class CheckinViewModel : ViewModelBase
 
         // 真实接入：日历按当月实际签到日期构建，连签天数从历史计算
         AccountHelpers.CleanupLegacyHistoryFiles();   // 顺手清理旧版每账号历史文件（幂等）
+        RefreshTodayState();
         ReloadCalendar();
         LoadHistory();
     }
@@ -120,10 +134,23 @@ public partial class CheckinViewModel : ViewModelBase
                   ?? cfg?.Accounts.FirstOrDefault();
         if (acc?.LastCheckinDate is DateTime lc) signed.Add(lc.Date);
         if (cfg?.LastCheckinDate is DateTime clc) signed.Add(clc.Date);
+
+        // 优先从 SQLite 读取
+        try
+        {
+            var dbDates = MainViewModel.CheckinDb?.GetSignedDates();
+            if (dbDates != null && dbDates.Count > 0)
+            {
+                foreach (var d in dbDates) signed.Add(d);
+                return signed;
+            }
+        }
+        catch { /* 数据库读取失败回退到文本文件 */ }
+
         foreach (var (date, line) in ReadAllHistory())
         {
             if (date == DateTime.MinValue) continue;
-            if (TryParseRecord(line, out var rec) && rec.Type == "签到失败") continue;   // 失败记录不算已签
+            if (TryParseRecord(line, out var rec) && rec.Type == "签到失败") continue;
             signed.Add(date);
         }
         return signed;
@@ -135,16 +162,44 @@ public partial class CheckinViewModel : ViewModelBase
         CalendarDays.Clear();
         try
         {
+            // 月首工作日偏移补位（周标头：日一...六；Sunday=0..Saturday=6），保证每月1号对齐正确星期列
+            var first = new DateTime(DateTime.Today.Year, DateTime.Today.Month, 1);
+            for (int i = 0; i < (int)first.DayOfWeek; i++)
+                CalendarDays.Add(new CalendarDay { Day = 0, State = "blank" });
+
             var signed = CollectSignedDates();
+
+            // 当月签到记录按日期分组（用于悬浮提示：当日签到账号及积分）
+            var byDate = new Dictionary<DateTime, List<string>>();
+            try
+            {
+                var records = MainViewModel.CheckinDb?.GetRecords(DateTime.Today.Year, DateTime.Today.Month, 500) ?? new();
+                foreach (var r in records)
+                {
+                    if (DateTime.TryParse(r.Date, out var rd))
+                    {
+                        if (!byDate.TryGetValue(rd.Date, out var lst)) byDate[rd.Date] = lst = new();
+                        var name = string.IsNullOrEmpty(r.AccountName) ? "账号" : r.AccountName;
+                        lst.Add($"{name} +{(int)r.Credits}");
+                    }
+                }
+            }
+            catch { /* 悬浮数据失败不影响日历 */ }
+
             int days = DateTime.DaysInMonth(DateTime.Today.Year, DateTime.Today.Month);
             for (int day = 1; day <= days; day++)
             {
                 var d = new DateTime(DateTime.Today.Year, DateTime.Today.Month, day);
                 string state;
-                if (d.Date == DateTime.Today) state = "today";
-                else if (signed.Contains(d.Date)) state = "checked";
+                if (signed.Contains(d.Date)) state = "checked";          // 已签（含今日已签）→ 蓝色
+                else if (d.Date == DateTime.Today) state = "today";      // 今天未签 → 今日高亮
                 else state = "empty";
-                CalendarDays.Add(new CalendarDay { Day = day, State = state });
+                var item = new CalendarDay { Day = day, State = state, Date = d };
+                if (byDate.TryGetValue(d.Date, out var list) && list.Count > 0)
+                    item.ToolTipText = $"{d:yyyy-MM-dd}\n" + string.Join("\n", list);
+                else
+                    item.ToolTipText = signed.Contains(d.Date) ? $"{d:yyyy-MM-dd}\n已签到" : $"{d:yyyy-MM-dd}\n未签到";
+                CalendarDays.Add(item);
             }
 
             // 连签天数：从今天（或昨天）向前连续计数
@@ -167,16 +222,34 @@ public partial class CheckinViewModel : ViewModelBase
         catch { /* 失败保持空日历 */ }
     }
 
-    /// <summary>读取签到历史列表（优先真实 history 文件；无真实数据时用示例）。</summary>
+    /// <summary>读取签到历史列表（优先 SQLite，回退文本文件；无数据时用示例）。</summary>
     private void LoadHistory()
     {
         Records.Clear();
-        var all = ReadAllHistory().Where(r => r.Date != DateTime.MinValue).ToList();
-        if (all.Count == 0)
+
+        // 优先从 SQLite 读取
+        try
         {
-            AddMockRecords();
-            return;
+            var dbRecords = MainViewModel.CheckinDb?.GetRecords(limit: 50);
+            if (dbRecords != null && dbRecords.Count > 0)
+            {
+                foreach (var r in dbRecords)
+                {
+                    Records.Add(new CheckinRecord
+                    {
+                        Date = $"{r.Date} {r.Time}",
+                        Account = r.AccountName,
+                        Type = "每日签到",
+                        Result = $"+{(int)r.Credits}",
+                    });
+                }
+                return;
+            }
         }
+        catch { /* 数据库读取失败回退到文本文件 */ }
+
+        var all = ReadAllHistory().Where(r => r.Date != DateTime.MinValue).ToList();
+        if (all.Count == 0) return;
         foreach (var (_, line) in all.Take(50))
         {
             if (!TryParseRecord(line, out var rec)) continue;
@@ -228,11 +301,6 @@ public partial class CheckinViewModel : ViewModelBase
         return true;
     }
 
-    private void AddMockRecords()
-    {
-        Records.Add(new CheckinRecord { Date = DateTime.Today.ToString("yyyy-MM-dd") + " 08:00", Account = "（示例）", Type = "示例数据", Result = "+150" });
-    }
-
     /// <summary>
     /// 自动签到检查：到点、启用且当天未签到时，对每个 Enabled 账号逐一执行签到。
     /// </summary>
@@ -249,8 +317,9 @@ public partial class CheckinViewModel : ViewModelBase
             if (MainViewModel.CheckinApi == null) return false;
             _lastAutoCheckDate = DateTime.Today;  // 到点时置位，本日不再重复触发
 
+            RebuildCheckList();   // 勾选与账号保持同步（新增账号也能进入自动签到）
             var (any, results) = await CheckinAllAccountsAsync();
-            if (any) { StatusMessage = "自动签到完成 ✓"; ReloadCalendar(); }
+            if (any) { StatusMessage = "自动签到完成 ✓"; RefreshTodayState(); ReloadCalendar(); LoadHistory(); }
             if (results.Any(r => r.Ok)) await NotifyFeishuBatchAsync(results);   // 全失败不打扰
             return any;
         }
@@ -292,28 +361,38 @@ public partial class CheckinViewModel : ViewModelBase
         bool any = false;
         if (cfg == null || api == null) return (false, results);
 
+        AccountHelpers.CheckinLog("", $"===== 批量签到开始，共 {cfg.Accounts.Count(a => a.Enabled)} 个启用账号 =====");
         int idx = 0;
         foreach (var acc in cfg.Accounts.Where(a => a.Enabled))
         {
-            // 账号间随机间隔 3~6 秒：避免同 IP 下连续 claim 被风控按时间窗聚合判定为「参与用户太多(9074)」
-            if (idx++ > 0) await Task.Delay(Random.Shared.Next(3000, 6000));
             var display = string.IsNullOrEmpty(acc.Name)
                 ? (acc.Id.Length > 6 ? acc.Id[..6] : acc.Id)
                 : acc.Name!;
 
-            // 一律先补发设备号（风控要求；含已签提前，避免用空/旧设备号去查状态）
-            AccountHelpers.EnsureDeviceId(acc);
+            // 账号间间隔：从配置读取基准秒数，附加 ±2 秒随机抖动
+            if (idx++ > 0)
+            {
+                int baseSec = cfg.CheckinIntervalSeconds > 0 ? cfg.CheckinIntervalSeconds : 5;
+                int jitter = Random.Shared.Next(-2000, 2001);
+                int delay = Math.Max(1000, baseSec * 1000 + jitter);
+                AccountHelpers.CheckinLog(display, $"等待 {delay}ms 后签到下一个账号");
+                await Task.Delay(delay);
+            }
 
-            // 未登录：计入失败汇总并给出原因，且写入失败历史
+            AccountHelpers.EnsureDeviceId(acc);
+            AccountHelpers.CheckinLog(display, $"开始签到，DeviceId={acc.DeviceId}，Token={(string.IsNullOrEmpty(acc.Token) ? "无" : "有")}，IsMember={acc.IsMember}");
+
+            // 未登录：计入失败汇总并给出原因（失败详情已由 checkin_log 记录）
             if (string.IsNullOrEmpty(acc.Token))
             {
-                TryAppendHistory(acc, 0, success: false, reason: "未登录");
+                AccountHelpers.CheckinLog(display, "跳过：未登录（Token 为空）");
                 results.Add((display, false, 0, "未登录"));
                 continue;
             }
             // 已签（本地记录）：计入成功、不计本日新增积分（历史已有当日记录）
             if (acc.LastCheckinDate.HasValue && acc.LastCheckinDate.Value.Date == DateTime.Today)
             {
+                AccountHelpers.CheckinLog(display, $"跳过：本地记录今日已签到（{acc.LastCheckinDate:HH:mm}）");
                 results.Add((display, true, 0, "今日已签"));
                 continue;
             }
@@ -323,10 +402,11 @@ public partial class CheckinViewModel : ViewModelBase
                 bool valid = await AccountHelpers.EnsureValidTokenAsync(acc);
                 if (!valid)
                 {
-                    TryAppendHistory(acc, 0, success: false, reason: "会话失效，请重新登录");
-                    results.Add((display, false, 0, "会话失效，请重新登录"));   // 登录态失效
+                    AccountHelpers.CheckinLog(display, "Token 校验失败且 Session 换新失败，登录态彻底失效");
+                    results.Add((display, false, 0, "会话失效，请重新登录"));
                     continue;
                 }
+                AccountHelpers.CheckinLog(display, "Token 校验通过");
                 // 真实状态判定：已真签（本地漏记）→ 补记并计入成功；未签才执行 claim
                 var st = await api.GetStatusAsync(acc.Token ?? "", acc.DeviceId);
                 if (st is { } s && s.code == 0 && s.checked_in)
@@ -334,22 +414,27 @@ public partial class CheckinViewModel : ViewModelBase
                     acc.LastCheckinDate = DateTime.Now;
                     double already = TraeCheckin.CheckinEvaluator.ResolveGainedCredits(s, acc.IsMember);
                     try { cfg.Save(); } catch { /* 忽略 */ }
+                    AccountHelpers.CheckinLog(display, $"服务器返回已签到，补记历史，积分={already}");
                     if (already > 0) TryAppendHistory(acc, already);   // 服务器已签而本地漏记 → 补写历史
                     results.Add((display, true, already, "今日已签"));
                     continue;
                 }
+                if (st != null)
+                    AccountHelpers.CheckinLog(display, $"Status 查询返回：code={st.code}, checked_in={st.checked_in}, message={st.message}");
+                else
+                    AccountHelpers.CheckinLog(display, "Status 查询返回 null（网络异常）");
 
                 var (g, reason) = await CheckinOneAccountAsync(acc);
                 if (g > 0) any = true;
-                if (g <= 0) TryAppendHistory(acc, 0, success: false, reason);   // 失败也留痕，原因可见
                 results.Add((display, g > 0, g, reason));
             }
-            catch
+            catch (Exception ex)
             {
-                TryAppendHistory(acc, 0, success: false, reason: "网络或接口异常");
+                AccountHelpers.CheckinLog(display, $"签到异常：{ex.Message}");
                 results.Add((display, false, 0, "网络或接口异常")); // 单账号失败继续下一个
             }
         }
+        AccountHelpers.CheckinLog("", $"===== 批量签到结束，成功 {results.Count(r => r.Ok)} / {results.Count} =====");
         return (any, results);
     }
 
@@ -358,20 +443,30 @@ public partial class CheckinViewModel : ViewModelBase
     {
         var cfg = MainViewModel.AppConfig;
         var api = MainViewModel.CheckinApi;
+        var displayName = string.IsNullOrEmpty(acc.Name) ? (acc.Id.Length > 6 ? acc.Id[..6] : acc.Id) : acc.Name!;
         if (cfg == null || api == null) return (0, "服务未初始化");
         AccountHelpers.EnsureDeviceId(acc);
         // token 失效则先用 Session 静默换新，避免 claim 因鉴权失败
         bool valid = await AccountHelpers.EnsureValidTokenAsync(acc);
-        if (!valid || string.IsNullOrEmpty(acc.Token)) return (0, "会话失效，请重新登录");
+        if (!valid || string.IsNullOrEmpty(acc.Token))
+        {
+            AccountHelpers.CheckinLog(displayName, "Claim 前 Token 校验失败");
+            return (0, "会话失效，请重新登录");
+        }
 
+        AccountHelpers.CheckinLog(displayName, $"调用 ClaimAsync，DeviceId={acc.DeviceId}");
         var result = await api.ClaimAsync(acc.Token, acc.DeviceId);
         if (result == null || result.code != 0)
         {
+            var code = result?.code ?? -1;
+            var msg = result?.message ?? "null response";
             var reason = api.LastError;
             if (string.IsNullOrEmpty(reason))
-                reason = "签到未成功（可能：今日已签 / 风控「参与用户太多」/ 会话失效）";
-            return (0, reason);   // claim 明确失败，原因透出
+                reason = $"签到失败：{msg}（code={code}）";
+            AccountHelpers.CheckinLog(displayName, $"Claim 失败：code={code}, message={msg}, LastError={api.LastError ?? "null"}");
+            return (0, reason);
         }
+        AccountHelpers.CheckinLog(displayName, $"Claim 成功：code={result.code}, checked_in={result.checked_in}");
 
         // claim 响应不含本次所得积分（源注释明确），签到成功后再查 status 解析（对齐源 CheckinOneAsync）
         double gained = 0;
@@ -379,8 +474,13 @@ public partial class CheckinViewModel : ViewModelBase
         {
             var after = await api.GetStatusAsync(acc.Token, acc.DeviceId);
             gained = TraeCheckin.CheckinEvaluator.ResolveGainedCredits(after ?? result, acc.IsMember);
+            if (after != null)
+                AccountHelpers.CheckinLog(displayName, $"签到后 Status 查询：code={after.code}, credits={after.credits}, extra_credits={after.extra_credits}, checked_in={after.checked_in}，解析 gained={gained}");
         }
-        catch { /* 状态查询失败不影响已成功签到 */ }
+        catch (Exception ex) { AccountHelpers.CheckinLog(displayName, $"签到后 Status 查询异常：{ex.Message}"); }
+
+        if (gained <= 0)
+            AccountHelpers.CheckinLog(displayName, "签到成功但本次积分解析为 0（如实记录，不虚构）");
 
         acc.LastCheckinDate = DateTime.Now;
         if (acc.Id == cfg.ActiveAccountId)
@@ -391,27 +491,92 @@ public partial class CheckinViewModel : ViewModelBase
         try
         {
             var credits = await api.GetRemainingCreditsAsync(acc.Token, acc.DeviceId);
-            if (credits >= 0 && string.IsNullOrEmpty(api.LastError)) cfg.LastRemaining = credits;
+            if (credits >= 0 && string.IsNullOrEmpty(api.LastError))
+            {
+                acc.RemainingCredits = credits;   // 按账号持久化
+                cfg.LastRemaining = credits;
+            }
         }
         catch { /* 积分刷新失败不影响 */ }
         try { cfg.Save(); } catch { /* 忽略 */ }
         TryAppendHistory(acc, gained);
+        AccountHelpers.CheckinLog(displayName, $"签到完成，获得 {gained} 积分，剩余 {cfg.LastRemaining}");
         return (gained, "");
     }
 
     /// <summary>历史读写锁（唯一真源在 AccountHelpers，这里仅转发）。</summary>
     private static object HistoryIoLock => AccountHelpers.HistoryIoLock;
 
+    /// <summary>签到页账号勾选列表（与 TraeAccount.Enabled 双向同步，勾谁签谁）。</summary>
+    public ObservableCollection<AccountCheckItem> CheckAccounts { get; } = new();
+
+    /// <summary>按当前账号重建勾选列表：新增的补上、删除的移除、显示名刷新，勾选状态保留。</summary>
+    private void RebuildCheckList()
+    {
+        if (MainViewModel.AppConfig?.Accounts is not { } accounts) return;
+        var ids = accounts.Select(a => a.Id).ToHashSet();
+        foreach (var item in CheckAccounts.Where(i => !ids.Contains(i.Id)).ToList())
+            CheckAccounts.Remove(item);
+        foreach (var acc in accounts)
+        {
+            var display = string.IsNullOrEmpty(acc.Name) ? (acc.Id.Length > 6 ? acc.Id[..6] : acc.Id) : acc.Name!;
+            var existing = CheckAccounts.FirstOrDefault(i => i.Id == acc.Id);
+            if (existing == null)
+            {
+                var item = new AccountCheckItem { Id = acc.Id, Display = display, IsChecked = acc.Enabled };
+                item.OnChanged = c =>
+                {
+                    var a = MainViewModel.AppConfig?.Accounts.FirstOrDefault(x => x.Id == c.Id);
+                    if (a == null || a.Enabled == c.IsChecked) return;
+                    a.Enabled = c.IsChecked;
+                    try { MainViewModel.AppConfig?.Save(); } catch { /* 忽略 */ }
+                };
+                CheckAccounts.Add(item);
+            }
+            else existing.Display = display;
+        }
+    }
+
     /// <summary>自动签到上次已触发日期（每日仅触发一次）。</summary>
     private static DateTime _lastAutoCheckDate = DateTime.MinValue;
 
     /// <summary>把签到结果写入本地历史文件（统一走 AccountHelpers，格式 date | name | type | 结果）。</summary>
-    private void TryAppendHistory(TraeCheckin.TraeAccount acc, double gained, bool success = true, string? reason = null)
-        => AccountHelpers.AppendHistory(acc, gained, success, reason);
+    private void TryAppendHistory(TraeCheckin.TraeAccount acc, double gained)
+        => AccountHelpers.AppendHistory(acc, gained);
+
+    /// <summary>今日奖励 + 今日已签状态：跨所有账号统计——任一账号未签即可一键签到，今日奖励为所有账号今日实际获得总积分。</summary>
+    private void RefreshTodayState()
+    {
+        try
+        {
+            var cfg = MainViewModel.AppConfig;
+            var accounts = cfg?.Accounts;
+            if (accounts == null || accounts.Count == 0)
+            {
+                TodayReward = "--";
+                CheckedInToday = false;
+                return;
+            }
+
+            // 一键签到 vs 今日已签：任一账号未签则允许点击（CheckedInToday=false）
+            bool allChecked = accounts.All(a => a.LastCheckinDate.HasValue && a.LastCheckinDate.Value.Date == DateTime.Today);
+            CheckedInToday = allChecked;
+
+            // 今日奖励：统计所有账号今日实际获得的总积分
+            double total = MainViewModel.CheckinDb?.GetTodayTotalCredits() ?? 0;
+            TodayReward = total > 0 ? "+" + (int)total : "--";
+        }
+        catch
+        {
+            TodayReward = "--";
+            CheckedInToday = false;
+        }
+    }
 
     /// <summary>账号切换联动：按新激活账号刷新会员/奖励/日历/记录。</summary>
     public void Reload()
     {
+        RebuildCheckList();
         try
         {
             var cfg = MainViewModel.AppConfig;
@@ -422,11 +587,11 @@ public partial class CheckinViewModel : ViewModelBase
                 IsMember = acc.IsMember;
                 MemberHint = acc.IsMember ? "会员：基础 150 + 连签 50" : "非会员：基础签到 150 积分";
                 MemberMultiplier = acc.IsMember ? "×1.33" : "×1.0";
-                TodayReward = acc.IsMember ? "+200" : "+150";
                 StatusMessage = acc.LastCheckinDate.HasValue && acc.LastCheckinDate.Value.Date == DateTime.Today
                     ? "今日已签到"
                     : "";
             }
+            RefreshTodayState();
             ReloadCalendar();
             LoadHistory();
         }
@@ -464,6 +629,7 @@ public partial class CheckinViewModel : ViewModelBase
                 StatusMessage = "服务未初始化";
                 return;
             }
+            RebuildCheckList();   // 勾选与账号保持同步（含刚添加的账号）
             if (cfg.Accounts.Count == 0)
             {
                 StatusMessage = "没有可用账号，请先在「设置」中添加";
@@ -495,6 +661,7 @@ public partial class CheckinViewModel : ViewModelBase
                 summary += "；失败：" + string.Join("、", fails.Select(f => $"{f.Name}：{f.Reason}"));
             StatusMessage = summary;
 
+            RefreshTodayState();
             ReloadCalendar();
             LoadHistory();
             if (results.Count > 0) await NotifyFeishuBatchAsync(results);

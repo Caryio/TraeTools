@@ -32,6 +32,10 @@ public partial class MainViewModel : ViewModelBase
     public static SettingsStore? SwitchSettings;
     public static VaultService? Vault;
     public static GitHubApiClient? GitHubApi;
+    public static CheckinDatabase? CheckinDb;
+
+    /// <summary>界面展示的应用版本号，与"关于/更新检查"（TraeTools.Services.AppVersion）同源。</summary>
+    public string AppVersion => Services.AppVersion.Display;
 
     public MainViewModel()
     {
@@ -76,9 +80,7 @@ public partial class MainViewModel : ViewModelBase
         {
             if (SwitchSettings != null)
             {
-                var vaultRoot = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                    "TraeSwitch", "vault");
+                var vaultRoot = TraeTools.Services.DataPaths.VaultDir;
                 Vault = new VaultService(SwitchSettings.Data.RootDir, vaultRoot);
             }
         }
@@ -94,6 +96,31 @@ public partial class MainViewModel : ViewModelBase
         catch
         {
             GitHubApi = null;
+        }
+
+        try
+        {
+            CheckinDb = new CheckinDatabase();
+            // 首次启动时从旧版文本文件迁移数据到数据库
+            // DataPaths.Migrate() 已在 Program.cs 中先行调用，文件已搬入新目录
+            // 这里扫描新目录（DataDir）即可；同时兼容扫描旧目录以防迁移未执行
+            int migrated = 0;
+            var newDataDir = TraeTools.Services.DataPaths.DataDir;
+            var oldBaseDir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "TraeCheckin");
+            var oldDataDir = Path.Combine(oldBaseDir, "data");
+            foreach (var dir in new[] { newDataDir, oldBaseDir, oldDataDir })
+            {
+                if (Directory.Exists(dir))
+                    migrated += CheckinDb.MigrateFromHistoryFiles(dir)
+                              + CheckinDb.MigrateFromSnapshotFiles(dir);
+            }
+            if (migrated > 0)
+                AccountHelpers.AppLog("account", "", $"从旧版文本文件迁移了 {migrated} 条记录到数据库");
+        }
+        catch
+        {
+            CheckinDb = null;
         }
 
         Instance = this;
@@ -113,6 +140,25 @@ public partial class MainViewModel : ViewModelBase
 
         CurrentPage = _dashboard;
         CurrentPageKey = "dashboard";
+
+        // 首次启动即按激活账号刷新仪表盘状态/积分/奖励（否则启动时只显示旧缓存，状态不更新）
+        _ = _dashboard.RefreshAllAsync();
+
+        // 启动日志：记录账号概况，便于排查问题
+        try
+        {
+            if (AppConfig != null)
+            {
+                var accs = AppConfig.Accounts;
+                AccountHelpers.AppLog("account", "", $"===== 程序启动，共 {accs.Count} 个账号 =====");
+                foreach (var a in accs)
+                {
+                    var n = string.IsNullOrEmpty(a.Name) ? (a.Id.Length > 6 ? a.Id[..6] : a.Id) : a.Name!;
+                    AccountHelpers.AppLog("account", n, $"DeviceId={a.DeviceId}，Token={(string.IsNullOrEmpty(a.Token) ? "无" : $"有({a.Token!.Length})")}，Enabled={a.Enabled}，LastCheckin={a.LastCheckinDate?.ToString("MM-dd HH:mm") ?? "无"}");
+                }
+            }
+        }
+        catch { /* 启动日志失败不影响 */ }
     }
 
     public bool IsDashboardActive => CurrentPageKey == "dashboard";
@@ -174,8 +220,14 @@ public partial class MainViewModel : ViewModelBase
             var acc = cfg.Accounts.FirstOrDefault(a => a.Id == cfg.ActiveAccountId)
                       ?? cfg.Accounts.FirstOrDefault();
             if (acc == null || string.IsNullOrEmpty(acc.Token)) return false;
+            var name = string.IsNullOrEmpty(acc.Name) ? (acc.Id.Length > 6 ? acc.Id[..6] : acc.Id) : acc.Name!;
+            AccountHelpers.CheckinLog(name, $"[托盘快签] 开始签到，DeviceId={acc.DeviceId}");
             var result = await api.ClaimAsync(acc.Token, acc.DeviceId);
-            if (result == null || result.code != 0) return false;
+            if (result == null || result.code != 0)
+            {
+                AccountHelpers.CheckinLog(name, $"[托盘快签] Claim 失败：code={result?.code ?? -1}, message={result?.message ?? "null"}");
+                return false;
+            }
             acc.LastCheckinDate = DateTime.Now;
             cfg.LastCheckinDate = DateTime.Now;
             try
@@ -184,12 +236,17 @@ public partial class MainViewModel : ViewModelBase
                 var after = await api.GetStatusAsync(acc.Token, acc.DeviceId);
                 double gained = TraeCheckin.CheckinEvaluator.ResolveGainedCredits(after ?? result, acc.IsMember);
                 AccountHelpers.AppendHistory(acc, gained);
+                AccountHelpers.CheckinLog(name, $"[托盘快签] 签到成功，获得 {gained} 积分");
             }
             catch { /* 历史写入失败不影响 */ }
             try
             {
                 var credits = await api.GetRemainingCreditsAsync(acc.Token, acc.DeviceId);
-                if (credits >= 0) cfg.LastRemaining = credits;
+                if (credits >= 0)
+                {
+                    acc.RemainingCredits = credits;   // 按账号持久化
+                    cfg.LastRemaining = credits;
+                }
             }
             catch { /* 积分刷新失败不影响签到结果 */ }
             try { cfg.Save(); } catch { /* 忽略 */ }

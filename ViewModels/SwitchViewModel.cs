@@ -3,6 +3,7 @@ using System.Collections.ObjectModel;
 using System.IO;
 using System.Linq;
 using System.Threading.Tasks;
+using Avalonia.Platform.Storage;
 using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using TraeSwitch.Services;
@@ -51,13 +52,125 @@ public partial class SwitchViewModel : ViewModelBase
         Steps.Add(new SwitchStep { Index = 5, Title = "判定结果", Description = "校验登录态", Status = "idle" });
 
         LoadAccounts();
+        EnsureFingerprint();   // 指纹为空时自动检测并回填，避免「未配置载体指纹」卡死建档/切换
+    }
+
+    /// <summary>
+    /// 载体指纹（Fingerprint）为空时，自动检测客户端登录态载体并写入 settings.json。
+    /// 原版需手动用 Probe 配置（Phase 0），合并版没有该入口 → 用户会在此卡死（issue #20）。
+    /// </summary>
+    private void EnsureFingerprint()
+    {
+        var settings = MainViewModel.SwitchSettings;
+        if (settings?.Data == null || settings.Data.Fingerprint.Count > 0) return;
+        var detected = TraeSwitch.Services.CarrierDefaults.DetectFingerprint();
+        if (detected.Count == 0)
+        {
+            AppendLog("未检测到客户端登录态载体（可能未安装 Trae 客户端或目录为空），请确认后再建档/切换");
+            return;
+        }
+        settings.Data.Fingerprint.AddRange(detected);
+        try { settings.Save(); } catch { /* 保存失败下次再写 */ }
+        AppendLog($"未配置载体指纹 → 已自动检测并写入 {detected.Count} 项：{string.Join("、", detected)}");
+        CarrierCount = settings.Data.Fingerprint.Count;
+        LoadAccounts();
     }
 
     private IClientController? BuildClient()
     {
         var settings = MainViewModel.SwitchSettings;
         if (settings == null) return null;
-        return new ClientController(settings.Data.ProcessName, settings.Data.ClientExe);
+        return new ClientController(settings.Data.ProcessName, ResolveClientExe(settings.Data.ClientExe));
+    }
+
+    /// <summary>
+    /// 客户端 exe 解析：配置路径失效（被移动/改名/历史遗留错误值）时，自动回退到自动探测结果，
+    /// 避免因 settings.json 里的旧路径把切换/启动卡死（#25）。
+    /// </summary>
+    private static string ResolveClientExe(string configured)
+    {
+        try
+        {
+            if (!string.IsNullOrEmpty(configured) && File.Exists(configured))
+                return configured;
+        }
+        catch { /* 校验失败走探测 */ }
+        return TraeSwitch.Services.CarrierDefaults.DefaultClientExe;
+    }
+
+    /// <summary>当前生效的客户端路径（配置值或探测回退）。</summary>
+    [ObservableProperty]
+    private string _clientExePath = "";
+
+    /// <summary>
+    /// 手动选择客户端 exe（文件对话框），写入 settings.json 的 ClientExe 并持久化。
+    /// 覆盖自动探测：适用于绿色版 / 自定义安装目录 / 多版本并存等探测无法命中的场景。
+    /// </summary>
+    [RelayCommand]
+    private async Task BrowseClientExe()
+    {
+        try
+        {
+            var win = UiHost.MainWindow;
+            if (win == null)
+            {
+                AppendLog("无法打开文件选择（主窗口未就绪）");
+                return;
+            }
+            var files = await win.StorageProvider.OpenFilePickerAsync(new FilePickerOpenOptions
+            {
+                Title = "选择 Trae 客户端程序（TRAE SOLO CN.exe）",
+                AllowMultiple = false,
+                FileTypeFilter = new[]
+                {
+                    new FilePickerFileType("可执行文件 (*.exe)") { Patterns = new[] { "*.exe" } },
+                    new FilePickerFileType("所有文件") { Patterns = new[] { "*" } },
+                },
+            });
+            var path = files.FirstOrDefault()?.TryGetLocalPath();
+            if (string.IsNullOrEmpty(path) || !File.Exists(path))
+            {
+                AppendLog("未选择有效文件，已取消");
+                return;
+            }
+            SetClientExe(path, $"已手动设置客户端路径：{path}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog("选择客户端失败：" + ex.Message);
+        }
+    }
+
+    /// <summary>重新自动探测客户端路径并写入配置（忽略之前缓存）。</summary>
+    [RelayCommand]
+    private void ReDetectClientExe()
+    {
+        try
+        {
+            CarrierDefaults.ResetDetection();
+            var exe = CarrierDefaults.DefaultClientExe;
+            SetClientExe(exe, $"已重新探测客户端路径：{exe}");
+        }
+        catch (Exception ex)
+        {
+            AppendLog("重新探测失败：" + ex.Message);
+        }
+    }
+
+    /// <summary>将客户端路径写入 settings.json 并刷新展示。</summary>
+    private void SetClientExe(string path, string log)
+    {
+        var settings = MainViewModel.SwitchSettings;
+        if (settings == null)
+        {
+            AppendLog("切换服务未初始化，路径未保存");
+            return;
+        }
+        settings.Data.ClientExe = path;
+        try { settings.Save(); } catch { /* 保存失败仍展示 */ }
+        ClientExePath = path;
+        ClientName = Path.GetFileNameWithoutExtension(path);
+        AppendLog(log);
     }
 
     /// <summary>加载账号列表：优先读取 TraeSwitch settings.json 真实账号，逐账号容错。</summary>
@@ -68,9 +181,7 @@ public partial class SwitchViewModel : ViewModelBase
 
         if (vault != null)
         {
-            VaultPath = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "TraeSwitch", "vault");
+            VaultPath = TraeTools.Services.DataPaths.VaultDir;
         }
 
         if (settings == null)
@@ -80,7 +191,11 @@ public partial class SwitchViewModel : ViewModelBase
         }
 
         UserDirectory = settings.Data.RootDir;
-        ClientName = Path.GetFileNameWithoutExtension(settings.Data.ClientExe);
+        var exe = ResolveClientExe(settings.Data.ClientExe);
+        if (!string.Equals(exe, settings.Data.ClientExe, StringComparison.OrdinalIgnoreCase))
+            AppendLog($"设置中的客户端路径无效（{settings.Data.ClientExe}），已自动回退到探测路径：{exe}");
+        ClientName = Path.GetFileNameWithoutExtension(exe);
+        ClientExePath = exe;
         CarrierCount = settings.Data.Fingerprint.Count;
 
         var accountNames = settings.Data.Accounts;
@@ -93,6 +208,21 @@ public partial class SwitchViewModel : ViewModelBase
         Accounts.Clear();
         var colors = new[] { "#3B82F6", "#10B981", "#F59E0B", "#8B5CF6", "#EC4899" };
         int idx = 0;
+
+        // 手机号索引：切换页账号名（建档名）→ 脱敏手机号（#14）。
+        // 与设置页账号管理同源（TraeAccount.MobileMasked），按备注名/平台昵称忽略大小写匹配。
+        var mobileByAccount = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        var appAccounts = MainViewModel.AppConfig?.Accounts;
+        if (appAccounts != null)
+        {
+            foreach (var ta in appAccounts)
+            {
+                if (string.IsNullOrWhiteSpace(ta.MobileMasked)) continue;
+                if (!string.IsNullOrWhiteSpace(ta.Name)) mobileByAccount.TryAdd(ta.Name, ta.MobileMasked);
+                if (!string.IsNullOrWhiteSpace(ta.ScreenName)) mobileByAccount.TryAdd(ta.ScreenName, ta.MobileMasked);
+            }
+        }
+
         foreach (var acc in accountNames)
         {
             idx++;
@@ -130,6 +260,7 @@ public partial class SwitchViewModel : ViewModelBase
                     Color = colors[(idx - 1) % colors.Length],
                     Status = status,
                     StatusType = statusType,
+                    MobileText = mobileByAccount.TryGetValue(acc, out var m) ? m : "",
                     CreatedAt = info?.CreatedLocal?.ToString("yyyy-MM-dd HH:mm") ?? "未建档",
                     Carriers = info?.EntryCount ?? 0,
                     Similarity = isCurrent ? "100%" : (info != null ? $"{(int)(score * 100)}%" : "—"),
@@ -158,7 +289,16 @@ public partial class SwitchViewModel : ViewModelBase
         LogText = $"[{DateTime.Now:HH:mm:ss}] {reason}\n请先在 TraeSwitch 或本页「建档」中备份账号登录态";
     }
 
-    private void AppendLog(string line) => LogText += $"\n[{DateTime.Now:HH:mm:ss}] {line}";
+    private void AppendLog(string line)
+    {
+        // 防无界增长（#33）：常驻托盘 7×24 运行，日志只进不出会持续涨内存；超限裁掉头部只留尾部
+        const int MaxLogChars = 20_000;
+        var text = LogText + $"\n[{DateTime.Now:HH:mm:ss}] {line}";
+        if (text.Length > MaxLogChars)
+            text = "…（日志已截断，只保留最近部分）\n" + text[^MaxLogChars..];
+        LogText = text;
+        AccountHelpers.AppLog("switch", "", line);
+    }
 
     private void ResetSteps()
     {
@@ -191,9 +331,10 @@ public partial class SwitchViewModel : ViewModelBase
             AppendLog("切换服务未初始化（TraeSwitch 配置缺失）");
             return;
         }
+        EnsureFingerprint();   // 切前兜底：仍为空则说明确实没有载体，转报明确提示
         if (settings.Data.Fingerprint.Count == 0)
         {
-            AppendLog("尚未配置载体指纹（settings.json Fingerprint 为空），无法切换");
+            AppendLog("尚未配置载体指纹，且未检测到客户端登录态载体，无法切换");
             return;
         }
 
@@ -267,13 +408,18 @@ public partial class SwitchViewModel : ViewModelBase
         {
             var cfg = MainViewModel.AppConfig;
             var acc = cfg?.Accounts.FirstOrDefault(a => string.Equals(a.Name, name, StringComparison.OrdinalIgnoreCase));
-            if (cfg == null || acc == null) return;
+            if (cfg == null || acc == null)
+            {
+                AppendLog($"同步激活账号失败：未在本地配置中找到「{name}」");
+                return;
+            }
             if (cfg.ActiveAccountId == acc.Id) { LoadAccounts(); return; }
             cfg.ActiveAccountId = acc.Id;
             try { cfg.Save(); } catch { /* 保存失败不阻断切换 */ }
+            AppendLog($"已同步激活账号为「{name}」");
             MainViewModel.NotifyActiveAccountChanged();
         }
-        catch { /* 同步失败不影响切换结果 */ }
+        catch (Exception ex) { AppendLog($"同步激活账号异常：{ex.Message}"); }
     }
 
     [RelayCommand]
@@ -314,6 +460,7 @@ public partial class SwitchViewModel : ViewModelBase
     [RelayCommand]
     private async Task CreateProfile()
     {
+        EnsureFingerprint();   // 建档前先确保指纹存在，否则只会备份出一个空壳 meta
         var settings = MainViewModel.SwitchSettings;
         var vault = MainViewModel.Vault;
         if (vault == null || settings == null) { AppendLog("建档失败：服务未初始化"); return; }
@@ -361,9 +508,18 @@ public partial class SwitchViewModel : ViewModelBase
             bool ok = await vault.VerifyAsync(account, settings.Data.Fingerprint);
             AppendLog($"建档完成：{count} 个载体文件，校验 {(ok ? "通过" : "未通过")}");
             LoadAccounts();
+            // 建档后自动选中新账号，用户可直接点「校验」复核，避免误报「无建档数据」（#34）
+            var created = Accounts.FirstOrDefault(a => string.Equals(a.Name, account, StringComparison.OrdinalIgnoreCase));
+            if (created != null) SelectedAccount = created;
         }
         catch (Exception ex) { AppendLog("建档失败：" + ex.Message); }
     }
+
+    /// <summary>快照刷新运行锁（防重入，见 TryAutoRefreshSnapshotAsync）。</summary>
+    private bool _refreshBusy;
+
+    /// <summary>最近一次快照检查时间；10 分钟内不重复全量哈希（#33：原先每 30 秒全量跑，一晚 2880 轮）。</summary>
+    private DateTime _lastRefreshCheckUtc = DateTime.MinValue;
 
     /// <summary>
     /// 快照自动刷新（TraeSwitch「会话保鲜」）：客户端已退出且能唯一识别当前账号、
@@ -371,6 +527,11 @@ public partial class SwitchViewModel : ViewModelBase
     /// </summary>
     internal async Task TryAutoRefreshSnapshotAsync()
     {
+        if (_refreshBusy) return;
+        var now = DateTime.UtcNow;
+        if ((now - _lastRefreshCheckUtc).TotalMinutes < 10) return;
+        _lastRefreshCheckUtc = now;
+        _refreshBusy = true;
         try
         {
             var settings = MainViewModel.SwitchSettings;
@@ -408,6 +569,7 @@ public partial class SwitchViewModel : ViewModelBase
         {
             AppendLog("快照自动刷新失败：" + ex.Message);
         }
+        finally { _refreshBusy = false; }
     }
 }
 

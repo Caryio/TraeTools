@@ -11,6 +11,15 @@
         <vm:SettingsViewModel />
     </Design.DataContext>
 
+    <UserControl.Styles>
+        <!-- 账号管理卡片：当前激活账号用高亮粗边框框出（与仪表盘账号概览一致） -->
+        <Style Selector="Border.acct-card.acct-active">
+            <Setter Property="BorderBrush" Value="{StaticResource AccentBrush}" />
+            <Setter Property="BorderThickness" Value="2" />
+            <Setter Property="Background" Value="#1A3B82F6" />
+        </Style>
+    </UserControl.Styles>
+
     <Grid RowDefinitions="*,Auto">
 
         <!-- ===== Scrollable Content ===== -->
@@ -48,6 +57,13 @@
                             </Grid>
                             <Grid ColumnDefinitions="*,Auto" Margin="0,4">
                                 <StackPanel Grid.Column="0" Spacing="2">
+                                    <TextBlock Text="签到间隔（秒）" FontSize="13" FontWeight="SemiBold" />
+                                    <TextBlock Text="多账号签到间隔，防止触发风控" FontSize="11" Foreground="{StaticResource TextMutedBrush}" />
+                                </StackPanel>
+                                <TextBox Grid.Column="1" Text="{Binding CheckinIntervalSeconds}" Width="90" Padding="6,4" HorizontalContentAlignment="Center" />
+                            </Grid>
+                            <Grid ColumnDefinitions="*,Auto" Margin="0,4">
+                                <StackPanel Grid.Column="0" Spacing="2">
                                     <TextBlock Text="开机自启" FontSize="13" FontWeight="SemiBold" />
                                     <TextBlock Text="系统启动时自动运行" FontSize="11" Foreground="{StaticResource TextMutedBrush}" />
                                 </StackPanel>
@@ -77,6 +93,21 @@
                                 <TextBlock Text="更新时间：" FontSize="11" Foreground="{StaticResource TextMutedBrush}" />
                                 <TextBlock Text="{Binding TokenUpdateTime}" FontSize="11" Foreground="{StaticResource TextMainBrush}" FontFamily="Consolas" />
                             </StackPanel>
+                            <Grid ColumnDefinitions="*,Auto" Margin="0,2">
+                                <StackPanel Grid.Column="0" Orientation="Horizontal" Spacing="6" VerticalAlignment="Center">
+                                    <TextBlock Text="设备号：" FontSize="11" Foreground="{StaticResource TextMutedBrush}" />
+                                    <TextBlock Text="{Binding DeviceIdText}" FontSize="11" Foreground="{StaticResource TextMainBrush}" FontFamily="Consolas"
+                                               TextTrimming="CharacterEllipsis" />
+                                </StackPanel>
+                                <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="6">
+                                    <Button Classes="btn" Content="一键换全部" Padding="10,4" FontSize="11"
+                                            Command="{Binding RenewAllDeviceIdsCommand}" />
+                                    <Button Classes="btn" Content="更换" Padding="10,4" FontSize="11"
+                                            Command="{Binding RegenerateDeviceIdCommand}" />
+                                </StackPanel>
+                            </Grid>
+                            <TextBlock Text="设备号被风控标记（签到 9074「参与用户太多」）时更换即可解除；云端签到需重新「云端部署」同步" FontSize="10"
+                                       Foreground="{StaticResource TextSubBrush}" TextWrapping="Wrap" />
                         </StackPanel>
                     </Border>
                 </Grid>
@@ -139,6 +170,7 @@
                                     <!-- 圆角卡片式账号行 -->
                                     <DataTemplate>
                                         <Border CornerRadius="10" Classes="acct-card"
+                                                Classes.acct-active="{Binding IsCurrent}"
                                                 Background="#FFF8FAFC" BorderBrush="#FFE2E8F0" BorderThickness="1"
                                                 Padding="10,8" Margin="2,4" HorizontalAlignment="Stretch">
                                             <Grid ColumnDefinitions="32,*,Auto">
@@ -193,6 +225,8 @@
                             </StackPanel>
                             <StackPanel Grid.Column="1" Orientation="Horizontal" Spacing="8" VerticalAlignment="Center">
                                 <Button Classes="btn" Content="重置协议" Command="{Binding ResetAgreementCommand}" />
+                                <Button Classes="btn" Content="重置软件" Command="{Binding ResetSoftwareCommand}"
+                                        Foreground="#FFEF4444" />
                                 <Button Classes="btn" Content="检查更新" Command="{Binding CheckUpdateCommand}" />
                             </StackPanel>
                         </Grid>
@@ -266,8 +300,9 @@
             </StackPanel>
         </ScrollViewer>
 
-        <!-- ===== Bottom Status Bar（全局交互返回） ===== -->
-        <Border Grid.Row="1" Background="#FFFBF5EB" BorderBrush="#FFE7C99B" BorderThickness="1,0,0,0">
+        <!-- ===== Bottom Status Bar（全局交互返回，有消息时显示、自动消失） ===== -->
+        <Border Grid.Row="1" Background="#FFFBF5EB" BorderBrush="#FFE7C99B" BorderThickness="1,0,0,0"
+                IsVisible="{Binding ShowStatusBar}">
             <Grid ColumnDefinitions="Auto,*" Margin="24,10">
                 <Border Grid.Column="0" Width="9" Height="9" CornerRadius="5" Background="#FFF59E0B" VerticalAlignment="Center" />
                 <TextBlock Grid.Column="1" Text="{Binding PushStatus}" FontSize="12" Foreground="#FF92400E"
