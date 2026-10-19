@@ -6,6 +6,7 @@ using CommunityToolkit.Mvvm.ComponentModel;
 using CommunityToolkit.Mvvm.Input;
 using TraeCheckin;
 using TraeSwitch.Services;
+using TraeTools.Services;
 using TraeTools.Services.Usage;
 
 namespace TraeTools.ViewModels;
@@ -18,6 +19,7 @@ public partial class MainViewModel : ViewModelBase
     private readonly CloudViewModel _cloud;
     private readonly SettingsViewModel _settings;
     private readonly UsageViewModel _usage;
+    private readonly LogViewModel _log;
 
     [ObservableProperty]
     private ViewModelBase? _currentPage;
@@ -129,7 +131,15 @@ public partial class MainViewModel : ViewModelBase
         _switch = new SwitchViewModel();
         _cloud = new CloudViewModel();
         _settings = new SettingsViewModel();
+        _settings.LoadExtendedSettings();   // 载入本 PR 新增的推送/日志/主题/设备号配置
+        // 设置页下拉改主题时，标题栏 ☾/☀ 图标同步刷新
+        _settings.PropertyChanged += (_, e) =>
+        {
+            if (e.PropertyName == nameof(SettingsViewModel.ThemeMode))
+                OnPropertyChanged(nameof(IsDarkMode));
+        };
         _usage = new UsageViewModel();
+        _log = new LogViewModel();
 
         _dashboard.NavigateRequested += p => Navigate(p);
         _checkin.NavigateRequested += p => Navigate(p);
@@ -137,6 +147,19 @@ public partial class MainViewModel : ViewModelBase
         _cloud.NavigateRequested += p => Navigate(p);
         _settings.NavigateRequested += p => Navigate(p);
         _usage.NavigateRequested += p => Navigate(p);
+        _log.NavigateRequested += p => Navigate(p);
+
+        // 顶栏账号下拉：默认选中当前激活账号（账号列表由 SwitchViewModel 在构造时载入）
+        try
+        {
+            var cfg0 = AppConfig;
+            var active = cfg0?.Accounts.FirstOrDefault(a => a.Id == cfg0.ActiveAccountId)
+                         ?? cfg0?.Accounts.FirstOrDefault();
+            if (active != null)
+                _switch.SelectedAccount = _switch.Accounts.FirstOrDefault(a => a.Id == active.Id);
+            RefreshTopBar();
+        }
+        catch { /* 顶栏初始化失败不影响主流程 */ }
 
         CurrentPage = _dashboard;
         CurrentPageKey = "dashboard";
@@ -167,6 +190,30 @@ public partial class MainViewModel : ViewModelBase
     public bool IsCloudActive => CurrentPageKey == "cloud";
     public bool IsSettingsActive => CurrentPageKey == "settings";
     public bool IsUsageActive => CurrentPageKey == "usage";
+    public bool IsLogActive => CurrentPageKey == "log";
+
+    /// <summary>标题栏显示的当前页面名。</summary>
+    public string CurrentPageTitle => CurrentPageKey switch
+    {
+        "usage" => "用量统计",
+        "checkin" => "每日签到",
+        "switch" => "账号切换",
+        "cloud" => "云端签到",
+        "log" => "运行日志",
+        "settings" => "设置",
+        _ => "仪表盘",
+    };
+
+    /// <summary>标题栏 ☾/☀ 图标状态：跟随当前生效主题实时变化（设置页下拉改动也会同步）。</summary>
+    public bool IsDarkMode => ThemeService.IsDark;
+
+    /// <summary>标题栏快捷开关：在明亮 / 深色之间切换；「跟随系统」仍可在设置页选择。</summary>
+    [RelayCommand]
+    private void ToggleTheme()
+    {
+        _settings.ThemeMode = ThemeService.IsDark ? ThemeService.Light : ThemeService.Dark;
+        OnPropertyChanged(nameof(IsDarkMode));
+    }
 
     partial void OnCurrentPageKeyChanged(string value)
     {
@@ -176,6 +223,8 @@ public partial class MainViewModel : ViewModelBase
         OnPropertyChanged(nameof(IsCloudActive));
         OnPropertyChanged(nameof(IsSettingsActive));
         OnPropertyChanged(nameof(IsUsageActive));
+        OnPropertyChanged(nameof(IsLogActive));
+        OnPropertyChanged(nameof(CurrentPageTitle));
     }
 
     /// <summary>账号管理切换激活账号后：仪表盘完整刷新 + 签到页 + 账号状态同步 + 用量页联动。</summary>
@@ -188,6 +237,7 @@ public partial class MainViewModel : ViewModelBase
             vm._checkin.Reload();
             vm._usage.Reload();
             await vm._settings.RefreshAccountStatesAsync();
+            vm.RefreshTopBar();   // 顶栏「当前生效」文案与下拉选中项随之更新
         }
         catch { /* 异步刷新失败不应导致崩溃 */ }
     }
@@ -282,6 +332,7 @@ public partial class MainViewModel : ViewModelBase
                 CurrentPageKey = "cloud";
                 break;
             case "settings":
+                _settings.LoadExtendedSettings();   // 每次进入都从配置重读，避免多页面改配置后界面过期
                 _ = _settings.RefreshAccountStatesAsync();
                 CurrentPage = _settings;
                 CurrentPageKey = "settings";
@@ -292,6 +343,13 @@ public partial class MainViewModel : ViewModelBase
                     CurrentPage = _usage;
                     CurrentPageKey = "usage";
                     break;
+            case "log":
+                // 进页面时重建「最近」内存缓冲并重扫磁盘文件（日志文件可能被其它进程追加）
+                _log.ReloadRecent();
+                _log.RefreshFiles();
+                CurrentPage = _log;
+                CurrentPageKey = "log";
+                break;
         }
     }
 }
